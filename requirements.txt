@@ -1,0 +1,12 @@
+torch>=1.12
+torchvision
+timm
+scikit-learn
+pandas
+numpy
+Pillow
+tqdm
+openpyxl
+opacus
+pennylane
+pennlane-lightning

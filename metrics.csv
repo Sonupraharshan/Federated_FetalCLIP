@@ -1,0 +1,11 @@
+head,split,round,acc,f1
+attention,iid,1,0.1897,0.0734
+attention,iid,2,0.2192,0.0683
+attention,iid,3,0.1895,0.0524
+attention,iid,4,0.3268,0.0875
+attention,iid,5,0.3619,0.1266
+attention,iid,6,0.3643,0.1286
+attention,iid,7,0.3738,0.1658
+attention,iid,8,0.3784,0.1756
+attention,iid,9,0.4058,0.2157
+attention,iid,10,0.4232,0.2221
