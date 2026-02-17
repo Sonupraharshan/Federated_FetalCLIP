@@ -9,4 +9,5 @@ tqdm
 openpyxl
 opacus
 pennylane
-pennlane-lightning
+pennylane-lightning
+open_clip_torch

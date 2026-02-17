@@ -5,6 +5,7 @@ from copy import deepcopy
 from models.heads import get_head
 from typing import Optional
 import config
+from torch.cuda.amp import autocast, GradScaler
 
 # --------------------- pack/unpack helpers ---------------------
 def _pack_state_dicts(encoder_state, head_state):
@@ -84,6 +85,7 @@ def local_train_feature(
     device,
     head_name,
     num_classes,
+    encoder_out_dim: Optional[int] = None,         # <-- ADD THIS
     finetune: Optional[bool] = None,                # <-- default None; use config if not provided
     encoder_lr: Optional[float] = None,
     head_lr: Optional[float] = None,
@@ -121,10 +123,14 @@ def local_train_feature(
     warmup_epochs = int(dp_cfg.get("warmup_epochs", 0))
     per_layer_scaling = bool(dp_cfg.get("per_layer_scaling", False))
 
+    # Determine encoder output dimension
+    if encoder_out_dim is None:
+        encoder_out_dim = encoder.out_dim if encoder is not None else 768
+    
     # Build head (QFL handled inside get_head)
     head = get_head(
         head_name,
-        input_dim=encoder.out_dim,
+        input_dim=encoder_out_dim,
         num_classes=num_classes,
         use_qfl=use_qfl,
         q_qubits=q_qubits,
@@ -160,10 +166,14 @@ def local_train_feature(
 
     # Scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, local_epochs))
+    
+    # Initialize AMP GradScaler
+    scaler = GradScaler(enabled=(device == "cuda"))
 
     # Print config summary (accurate)
     print(f"\n📌 Local training start | finetune={finetune} | use_dp={use_dp} | qfl={use_qfl}")
-    print(f"    DP config: clip_norm={clip_norm}, noise_mult={noise_mult}, accum_steps={accum_steps}, warmup_epochs={warmup_epochs}")
+    if use_dp:
+        print(f"    DP config: clip_norm={clip_norm}, noise_mult={noise_mult}, accum_steps={accum_steps}, warmup_epochs={warmup_epochs}")
 
     # Training loop with accumulation and robust manual DP
     for epoch in range(1, local_epochs + 1):
@@ -181,7 +191,10 @@ def local_train_feature(
             batch_count += 1
 
             # Extract features (encoder used for features; gradients flow if finetune True)
-            if finetune:
+            # When using cached features, encoder is None and xb already contains embeddings
+            if encoder is None:
+                feats = xb
+            elif finetune:
                 feats = model.encoder(xb)
             else:
                 with torch.no_grad():
@@ -191,17 +204,23 @@ def local_train_feature(
                 feats = torch.nn.functional.adaptive_avg_pool2d(feats, (1, 1))
                 feats = feats.view(feats.size(0), -1)
 
-            # Forward through head
-            if finetune:
-                logits = model.head(feats)
-            else:
-                logits = model(feats) if (isinstance(model, nn.Module) and model is not head) else head(feats)
+            # Forward through head with AMP
+            with autocast(enabled=(device == "cuda")):
+                if finetune:
+                    logits = model.head(feats)
+                else:
+                    logits = model(feats) if (isinstance(model, nn.Module) and model is not head) else head(feats)
 
-            loss = criterion(logits, yb) / accum_steps
-            loss.backward()
+                loss = criterion(logits, yb) / accum_steps
+
+            # Scale loss and backward
+            scaler.scale(loss).backward()
 
             # accumulate
             if (i + 1) % accum_steps == 0:
+                # Unscale gradients before clipping/DP
+                scaler.unscale_(optimizer)
+
                 # Manual DP step (fixed clip_norm)
                 if use_dp and dp_active:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
@@ -221,8 +240,10 @@ def local_train_feature(
                     for p in model.parameters():
                         if p.grad is not None:
                             sanitize_tensor_(p.grad, name=f"grad_after_noise:{p.shape}")
-
-                optimizer.step()
+                
+                # Step with scaler
+                scaler.step(optimizer)
+                scaler.update()
 
                 # sanitize parameters to prevent NaN/Inf propagation
                 for p in model.parameters():
@@ -230,11 +251,17 @@ def local_train_feature(
                         sanitize_tensor_(p.data, name=f"param:{p.shape}")
 
                 optimizer.zero_grad()
+            
+            # Progress indicator every 10 batches
+            if (i + 1) % 10 == 0:
+                avg_loss = total_loss / (i + 1)
+                print(f"      Epoch {epoch}/{local_epochs} | Batch {i+1}/{len(dataloader)} | Loss: {avg_loss:.4f}")
 
             total_loss += (loss.item() * accum_steps)
 
         # leftover batches
         if (len(dataloader) % accum_steps) != 0:
+            scaler.unscale_(optimizer)
             if use_dp and dp_active:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
                 for p in model.parameters():
@@ -242,7 +269,8 @@ def local_train_feature(
                         sanitize_tensor_(p.grad, name=f"grad:{p.shape}")
                         p.grad.add_(noise_mult * clip_norm * torch.randn_like(p.grad))
                         sanitize_tensor_(p.grad, name=f"grad_after_noise:{p.shape}")
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             for p in model.parameters():
                 sanitize_tensor_(p.data, name=f"param:{p.shape}")
             optimizer.zero_grad()

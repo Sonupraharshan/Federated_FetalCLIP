@@ -13,13 +13,15 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-4
 ENCODER_LR = 5e-5
 HEAD_LR = 1e-4
-PRETRAINED_ENCODER_PATH = None  # set path to fetalclip pretrained if available
-FINETUNE_ENCODER = True          # set to True to fine-tune encoder
-CLASS_WEIGHTS = None             # or a list / numpy array of weights
+# Paths
 DATA_PATH = os.path.abspath("./data")  # or use absolute path like "D:/EC22b1011/Federated_FetalCLIP/data"
 HEADS = [ "mlp", "resnet18", "efficientnet_b0", "densenet121", "vit_small"]
 LOG_DIR = "./logs/"
 CHECKPOINT_DIR = "./results/checkpoints/"
+
+# FetalCLIP Model Paths
+FETALCLIP_CONFIG_PATH = "./FetalCLIP_config.json"    # Download from: https://github.com/BioMedIA-MBZUAI/FetalCLIP
+FETALCLIP_WEIGHTS_PATH = "./FetalCLIP_weights.pt"    # Download from: SharePoint link in repo
 
 # DP (Differential Privacy)
 USE_DP = False

@@ -1,3 +1,9 @@
 /.vscode
 /venv
-/__pycache__
+__pycache__/
+*.pyc
+check_gpu.py
+COMBINED_WORKFLOW_CFL_DP_QFL.md
+ARCHITECTURE_ASCII.md
+FetalCLIP_weights.pt
+FetalCLIP_config.json

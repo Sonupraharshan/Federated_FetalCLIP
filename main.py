@@ -3,6 +3,7 @@ import argparse
 import os
 import config as cfg
 from data.dataset_loader import make_dataloaders
+from data.cached_loader import load_cached_features
 from models.fetalclip_encoder import FetalCLIPEncoder
 from federated.server import run_federated
 from metrics_logger import init_metrics
@@ -28,6 +29,7 @@ def parse_args():
     parser.add_argument('--use_qfl', action='store_true')
     parser.add_argument('--q_qubits', type=int, default=getattr(cfg,'QFL_QUBITS',4))
     parser.add_argument('--q_out_dim', type=int, default=getattr(cfg,'QFL_OUTPUT_DIM',8))
+    parser.add_argument('--use_cached_features', action='store_true', help='Use pre-computed FetalCLIP embeddings')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -44,20 +46,46 @@ if __name__ == '__main__':
     cfg.USE_QFL = bool(args.use_qfl)
     cfg.QFL_QUBITS = int(args.q_qubits)
     cfg.QFL_OUTPUT_DIM = int(args.q_out_dim)
+    cfg.USE_CACHED_FEATURES = bool(args.use_cached_features)
+
+    # Print effective configuration for visibility
+    print("\n-- Effective Config --")
+    print(f" FINETUNE_ENCODER={cfg.FINETUNE_ENCODER} | USE_DP={cfg.USE_DP} | USE_CFL={cfg.USE_CFL} | USE_QFL={cfg.USE_QFL} | USE_CACHED_FEATURES={cfg.USE_CACHED_FEATURES}")
+    print(f" NUM_CLIENTS={cfg.NUM_CLIENTS} | ROUNDS={cfg.ROUNDS} | LOCAL_EPOCHS={cfg.LOCAL_EPOCHS} | BATCH_SIZE={cfg.BATCH_SIZE}")
 
     ensure_dirs()
     init_metrics()
+    
+    # Load data (either from cache or raw images)
+    if cfg.USE_CACHED_FEATURES:
+        print("\n[*] Loading pre-computed FetalCLIP embeddings...")
+        client_loaders, test_loader, label_map = load_cached_features(
+            num_clients=cfg.NUM_CLIENTS,
+            batch_size=cfg.BATCH_SIZE
+        )
+        encoder = None  # Not needed when using cached features
+        encoder_out_dim = 768  # FetalCLIP output dimension
+        print("[OK] Cached features loaded!")
+    else:
+        print("\n[DATA] Loading raw images from disk...")
+        client_loaders, test_loader, label_map = make_dataloaders(
+            cfg.DATA_PATH,
+            num_clients=cfg.NUM_CLIENTS,
+            iid=(args.split=='iid'),
+            batch_size=cfg.BATCH_SIZE
+        )
+        print("Label map:", label_map)
 
-    client_loaders, test_loader, label_map = make_dataloaders(cfg.DATA_PATH, num_clients=cfg.NUM_CLIENTS,
-                                                              iid=(args.split=='iid'),
-                                                              batch_size=cfg.BATCH_SIZE)
-    print("Label map:", label_map)
+        print("\n📦 Loading FetalCLIP encoder...")
+        encoder = FetalCLIPEncoder(
+            feature_dim=getattr(cfg,'FEATURE_DIM',512),
+            pretrained_path=getattr(cfg,'FETALCLIP_WEIGHTS_PATH',None),
+            config_path=getattr(cfg,'FETALCLIP_CONFIG_PATH',None),
+            device=cfg.DEVICE
+        )
+        encoder.to(cfg.DEVICE)
+        encoder_out_dim = encoder.out_dim
+        print(f"✅ Encoder loaded (out_dim={encoder_out_dim})")
 
-    encoder = FetalCLIPEncoder(feature_dim=getattr(cfg,'FEATURE_DIM',512),
-                               pretrained_path=getattr(cfg,'PRETRAINED_ENCODER_PATH',None),
-                               device=cfg.DEVICE)
-    encoder.to(cfg.DEVICE)
-    print(f"Encoder out_dim = {encoder.out_dim}")
-
-    final_state = run_federated(encoder, args.head, client_loaders, test_loader, cfg, split_name=args.split)
+    final_state = run_federated(encoder, args.head, client_loaders, test_loader, cfg, split_name=args.split, encoder_out_dim=encoder_out_dim)
     print("Done.")

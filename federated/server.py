@@ -12,33 +12,71 @@ from sklearn.metrics import accuracy_score, f1_score
 
 
 def compute_client_summary(encoder, loader, device):
-    encoder.eval()
-    feats_list = []
-    with torch.no_grad():
-        for xb, _ in loader:
-            xb = xb.to(device)
-            f = encoder(xb)
-            if f.dim() > 2:
-                f = torch.nn.functional.adaptive_avg_pool2d(f, (1, 1))
-                f = f.view(f.size(0), -1)
-            feats_list.append(f.mean(dim=0).cpu().numpy())
-    if not feats_list:
-        return None
-    return np.mean(feats_list, axis=0)
+    """Compute client summary from encoder or cached features"""
+    if encoder is None:
+        # Using cached features: compute mean of embeddings directly
+        feats_list = []
+        with torch.no_grad():
+            for xb, _ in loader:  # xb is already embeddings when using cached features
+                xb = xb.to(device)
+                feats_list.append(xb.mean(dim=0).cpu().numpy())
+        if not feats_list:
+            return None
+        return np.mean(feats_list, axis=0)
+    else:
+        # Using raw images: extract features with encoder
+        encoder.eval()
+        feats_list = []
+        total_batches = len(loader) if hasattr(loader, '__len__') else None
+        with torch.no_grad():
+            for idx, (xb, _) in enumerate(loader):
+                try:
+                    xb = xb.to(device)
+                    f = encoder(xb)
+                except Exception as e:
+                    print(f"   ⚠️  Error while running encoder for client summary: {e}")
+                    raise
+
+                if f.dim() > 2:
+                    f = torch.nn.functional.adaptive_avg_pool2d(f, (1, 1))
+                    f = f.view(f.size(0), -1)
+                feats_list.append(f.mean(dim=0).cpu().numpy())
+
+                # progress print every 50 batches (or on last batch)
+                if total_batches is not None:
+                    if (idx + 1) % 50 == 0 or (idx + 1) == total_batches:
+                        print(f"      Extracted features from {idx+1}/{total_batches} batches for this client")
+                else:
+                    if (idx + 1) % 50 == 0:
+                        print(f"      Extracted features from {idx+1} batches for this client")
+
+        if not feats_list:
+            return None
+        return np.mean(feats_list, axis=0)
 
 
-def run_federated(encoder, head_name, client_loaders, test_loader, config, split_name='iid'):
+def run_federated(encoder, head_name, client_loaders, test_loader, config, split_name='iid', encoder_out_dim=None):
     device = config.DEVICE
     head_name = head_name.lower()
+    
+    # Determine encoder output dimension
+    if encoder_out_dim is None:
+        encoder_out_dim = encoder.out_dim if encoder is not None else 768
 
     finetune = getattr(config, "FINETUNE_ENCODER", True)
     freeze_rounds = getattr(config, "FREEZE_ENCODER_ROUNDS", 2)
     use_dp = getattr(config, "USE_DP", False)
     use_cfl = getattr(config, "USE_CFL", False)
     use_qfl = getattr(config, "USE_QFL", False)
+    use_cached = getattr(config, "USE_CACHED_FEATURES", False)
 
     q_qubits = getattr(config, "QFL_QUBITS", 4)
     q_out_dim = getattr(config, "QFL_OUTPUT_DIM", 8)
+    
+    # When using cached features, disable encoder finetuning
+    if use_cached:
+        finetune = False
+        print("   ⚠️  Using cached features → encoder finetuning disabled")
 
     dp_cfg = {
         "clip_norm": 3.0,
@@ -54,15 +92,21 @@ def run_federated(encoder, head_name, client_loaders, test_loader, config, split
     except Exception:
         num_classes = 6
 
-    prototype_head = get_head(head_name, input_dim=encoder.out_dim, num_classes=num_classes,
+    prototype_head = get_head(head_name, input_dim=encoder_out_dim, num_classes=num_classes,
                               use_qfl=use_qfl, q_qubits=q_qubits, q_out_dim=q_out_dim).to(device)
 
     # Initialize global states
     if use_cfl:
         # compute summaries and cluster clients
         summaries = []
-        for loader in client_loaders:
+        for idx, loader in enumerate(client_loaders):
+            try:
+                ds_len = len(loader.dataset) if hasattr(loader, 'dataset') else 'unknown'
+            except Exception:
+                ds_len = 'unknown'
+            print(f"   🔄 Computing summary for client {idx+1}/{len(client_loaders)} (samples={ds_len})...")
             s = compute_client_summary(encoder, loader, device)
+            print(f"   ✅ Summary for client {idx+1} computed. shape={None if s is None else s.shape}")
             summaries.append(s)
         summaries = np.stack(summaries)
         k = getattr(config, "CFL_NUM_CLUSTERS", 2)
@@ -116,6 +160,7 @@ def run_federated(encoder, head_name, client_loaders, test_loader, config, split
                         encoder, cluster_states[cid], loader,
                         config.LOCAL_EPOCHS, config.LR, config.DEVICE,
                         head_name, num_classes,
+                        encoder_out_dim=encoder_out_dim,
                         finetune=finetune_round,
                         encoder_lr=getattr(config, "ENCODER_LR", None),
                         head_lr=getattr(config, "HEAD_LR", None),
@@ -143,15 +188,15 @@ def run_federated(encoder, head_name, client_loaders, test_loader, config, split
                 if finetune:
                     enc_sd, head_sd = _unpack_state_dicts(cluster_states[cid])
                     encoder.load_state_dict(enc_sd, strict=False)
-                    head = get_head(head_name, input_dim=encoder.out_dim, num_classes=num_classes,
+                    head = get_head(head_name, input_dim=encoder_out_dim, num_classes=num_classes,
                                     use_qfl=use_qfl, q_qubits=q_qubits, q_out_dim=q_out_dim).to(device)
                     head.load_state_dict(head_sd, strict=False)
                     eval_model = torch.nn.Sequential(encoder, head).to(device)
                 else:
-                    head = get_head(head_name, input_dim=encoder.out_dim, num_classes=num_classes,
+                    head = get_head(head_name, input_dim=encoder_out_dim, num_classes=num_classes,
                                     use_qfl=use_qfl, q_qubits=q_qubits, q_out_dim=q_out_dim).to(device)
                     head.load_state_dict(cluster_states[cid], strict=False)
-                    eval_model = torch.nn.Sequential(encoder, head).to(device)
+                    eval_model = torch.nn.Sequential(encoder, head) if encoder is not None else head
 
                 preds, trues = [], []
                 eval_model.eval()
@@ -177,10 +222,12 @@ def run_federated(encoder, head_name, client_loaders, test_loader, config, split
             client_states = []
             weights = []
             for i, loader in enumerate(client_loaders):
+                print(f"\n   📱 Client {i+1}/{len(client_loaders)} training...")
                 sd = local_train_feature(
                     encoder, global_state, loader,
                     config.LOCAL_EPOCHS, config.LR, config.DEVICE,
                     head_name, num_classes,
+                    encoder_out_dim=encoder_out_dim,
                     finetune=finetune_round,
                     encoder_lr=getattr(config, "ENCODER_LR", None),
                     head_lr=getattr(config, "HEAD_LR", None),
@@ -191,23 +238,27 @@ def run_federated(encoder, head_name, client_loaders, test_loader, config, split
                 )
                 client_states.append(sd)
                 weights.append(len(loader.dataset))
-                print(f"Client {i} finished local training ({len(loader.dataset)} samples)")
+                print(f"   ✅ Client {i+1} done ({len(loader.dataset)} samples)")
 
+            print(f"\n   🔄 Aggregating models (FedAvg)...")
             global_state = fedavg(client_states, weights)
+            print(f"   ✅ Aggregation complete")
 
             # evaluate global
+            print(f"   📊 Evaluating on test set...")
             if finetune:
                 enc_sd, head_sd = _unpack_state_dicts(global_state)
                 encoder.load_state_dict(enc_sd, strict=False)
-                head = get_head(head_name, input_dim=encoder.out_dim, num_classes=num_classes,
+                head = get_head(head_name, input_dim=encoder_out_dim, num_classes=num_classes,
                                 use_qfl=use_qfl, q_qubits=q_qubits, q_out_dim=q_out_dim).to(device)
                 head.load_state_dict(head_sd, strict=False)
                 eval_model = torch.nn.Sequential(encoder, head).to(device)
             else:
-                head = get_head(head_name, input_dim=encoder.out_dim, num_classes=num_classes,
+                head = get_head(head_name, input_dim=encoder_out_dim, num_classes=num_classes,
                                 use_qfl=use_qfl, q_qubits=q_qubits, q_out_dim=q_out_dim).to(device)
                 head.load_state_dict(global_state, strict=False)
-                eval_model = torch.nn.Sequential(encoder, head).to(device)
+                # When using cached features, encoder is None, so use only the head
+                eval_model = head if encoder is None else torch.nn.Sequential(encoder, head).to(device)
 
             preds, trues = [], []
             eval_model.eval()
@@ -219,7 +270,7 @@ def run_federated(encoder, head_name, client_loaders, test_loader, config, split
                     trues.extend(yb.cpu().tolist())
             acc = accuracy_score(trues, preds)
             f1 = f1_score(trues, preds, average='macro')
-            print(f"🎯 Round {rnd} | Acc={acc:.4f} | F1={f1:.4f}")
+            print(f"\n🎯 Round {rnd}/{config.ROUNDS} | Acc={acc:.4f} | F1={f1:.4f}")
             log_metric(head_name, split_name, rnd, float(acc), float(f1))
 
     # Save final models
